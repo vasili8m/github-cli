@@ -156,6 +156,14 @@ func (pr PullRequest) HeadLabel() string {
 	return pr.HeadRefName
 }
 
+func (pr PullRequest) Link() string {
+	return pr.URL
+}
+
+func (pr PullRequest) Identifier() string {
+	return pr.ID
+}
+
 type PullRequestReviewStatus struct {
 	ChangesRequested bool
 	Approved         bool

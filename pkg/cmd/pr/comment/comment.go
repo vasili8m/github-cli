@@ -2,64 +2,27 @@ package comment
 
 import (
 	"errors"
-	"fmt"
 	"net/http"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/api"
 	"github.com/cli/cli/context"
-	"github.com/cli/cli/internal/config"
 	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
-	"github.com/cli/cli/pkg/iostreams"
-	"github.com/cli/cli/pkg/surveyext"
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
 
-type CommentOptions struct {
-	IO         *iostreams.IOStreams
-	HttpClient func() (*http.Client, error)
-	BaseRepo   func() (ghrepo.Interface, error)
-	Remotes    func() (context.Remotes, error)
-	Branch     func() (string, error)
-
-	EditSurvey          func() (string, error)
-	InputTypeSurvey     func() (inputType, error)
-	ConfirmSubmitSurvey func() (bool, error)
-	OpenInBrowser       func(string) error
-
-	SelectorArg string
-	Interactive bool
-	InputType   inputType
-	Body        string
-}
-
-type inputType int
-
-const (
-	inputTypeEditor inputType = iota
-	inputTypeInline
-	inputTypeWeb
-)
-
-func NewCmdComment(f *cmdutil.Factory, runF func(*CommentOptions) error) *cobra.Command {
-	opts := &CommentOptions{
-		IO:         f.IOStreams,
-		HttpClient: f.HttpClient,
-		Remotes:    f.Remotes,
-		Branch:     f.Branch,
-
-		EditSurvey:          editSurvey(f.Config, f.IOStreams),
-		InputTypeSurvey:     inputTypeSurvey,
-		ConfirmSubmitSurvey: confirmSubmitSurvey,
-		OpenInBrowser:       utils.OpenInBrowser,
+func NewCmdComment(f *cmdutil.Factory, runF func(*shared.CommentableOptions) error) *cobra.Command {
+	opts := &shared.CommentableOptions{
+		IO:                    f.IOStreams,
+		HttpClient:            f.HttpClient,
+		EditSurvey:            shared.CommentableEditSurvey(f.Config, f.IOStreams),
+		InteractiveEditSurvey: shared.CommentableInteractiveEditSurvey(f.Config, f.IOStreams),
+		ConfirmSubmitSurvey:   shared.CommentableConfirmSubmitSurvey,
+		OpenInBrowser:         utils.OpenInBrowser,
 	}
-
-	var webMode bool
-	var editorMode bool
 
 	cmd := &cobra.Command{
 		Use:   "comment [<number> | <url> | <branch>]",
@@ -67,147 +30,49 @@ func NewCmdComment(f *cmdutil.Factory, runF func(*CommentOptions) error) *cobra.
 		Example: heredoc.Doc(`
 			$ gh pr comment 22 --body "This looks great, lets get it deployed."
 		`),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// support `-R, --repo` override
-			opts.BaseRepo = f.BaseRepo
-
+		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if repoOverride, _ := cmd.Flags().GetString("repo"); repoOverride != "" && len(args) == 0 {
 				return &cmdutil.FlagError{Err: errors.New("argument required when using the --repo flag")}
 			}
-
+			var selector string
 			if len(args) > 0 {
-				opts.SelectorArg = args[0]
+				selector = args[0]
 			}
-
-			inputFlags := 0
-			if cmd.Flags().Changed("body") {
-				opts.InputType = inputTypeInline
-				inputFlags++
-			}
-			if webMode {
-				opts.InputType = inputTypeWeb
-				inputFlags++
-			}
-			if editorMode {
-				opts.InputType = inputTypeEditor
-				inputFlags++
-			}
-
-			if inputFlags == 0 {
-				if !opts.IO.CanPrompt() {
-					return &cmdutil.FlagError{Err: errors.New("--body or --web required when not running interactively")}
-				}
-				opts.Interactive = true
-			} else if inputFlags == 1 {
-				if !opts.IO.CanPrompt() && opts.InputType == inputTypeEditor {
-					return &cmdutil.FlagError{Err: errors.New("--body or --web required when not running interactively")}
-				}
-			} else if inputFlags > 1 {
-				return &cmdutil.FlagError{Err: fmt.Errorf("specify only one of --body, --editor, or --web")}
-			}
-
+			opts.RetrieveCommentable = retrievePR(f.HttpClient, f.BaseRepo, f.Branch, f.Remotes, selector)
+			return shared.CommentablePreRun(cmd, opts)
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
 			if runF != nil {
 				return runF(opts)
 			}
-			return commentRun(opts)
+			return shared.CommentableRun(opts)
 		},
 	}
 
 	cmd.Flags().StringVarP(&opts.Body, "body", "b", "", "Supply a body. Will prompt for one otherwise.")
-	cmd.Flags().BoolVarP(&editorMode, "editor", "e", false, "Add body using editor")
-	cmd.Flags().BoolVarP(&webMode, "web", "w", false, "Add body in browser")
+	cmd.Flags().BoolP("editor", "e", false, "Add body using editor")
+	cmd.Flags().BoolP("web", "w", false, "Add body in browser")
 
 	return cmd
 }
 
-func commentRun(opts *CommentOptions) error {
-	httpClient, err := opts.HttpClient()
-	if err != nil {
-		return err
-	}
-	apiClient := api.NewClientFromHTTP(httpClient)
-
-	pr, repo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
-	if err != nil {
-		return err
-	}
-
-	if opts.Interactive {
-		inputType, err := opts.InputTypeSurvey()
+func retrievePR(httpClient func() (*http.Client, error),
+	baseRepo func() (ghrepo.Interface, error),
+	branch func() (string, error),
+	remotes func() (context.Remotes, error),
+	selector string) func() (shared.Commentable, ghrepo.Interface, error) {
+	return func() (shared.Commentable, ghrepo.Interface, error) {
+		httpClient, err := httpClient()
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		opts.InputType = inputType
-	}
+		apiClient := api.NewClientFromHTTP(httpClient)
 
-	switch opts.InputType {
-	case inputTypeWeb:
-		openURL := pr.URL + "#issuecomment-new"
-		if opts.IO.IsStdoutTTY() {
-			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
-		}
-		return opts.OpenInBrowser(openURL)
-	case inputTypeEditor:
-		body, err := opts.EditSurvey()
+		pr, repo, err := shared.PRFromArgs(apiClient, baseRepo, branch, remotes, selector)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		opts.Body = body
-	}
 
-	if opts.Interactive {
-		cont, err := opts.ConfirmSubmitSurvey()
-		if err != nil {
-			return err
-		}
-		if !cont {
-			return fmt.Errorf("Discarding...")
-		}
-	}
-
-	params := api.CommentCreateInput{Body: opts.Body, SubjectId: pr.ID}
-	url, err := api.CommentCreate(apiClient, repo.RepoHost(), params)
-	if err != nil {
-		return err
-	}
-	fmt.Fprintln(opts.IO.Out, url)
-	return nil
-}
-
-var inputTypeSurvey = func() (inputType, error) {
-	var result int
-	inputTypeQuestion := &survey.Select{
-		Message: "Where do you want to draft your comment?",
-		Options: []string{"Editor", "Web"},
-	}
-	err := survey.AskOne(inputTypeQuestion, &result)
-	if err != nil {
-		return 0, err
-	}
-
-	if result == 0 {
-		return inputTypeEditor, nil
-	} else {
-		return inputTypeWeb, nil
-	}
-}
-
-var confirmSubmitSurvey = func() (bool, error) {
-	var confirm bool
-	submit := &survey.Confirm{
-		Message: "Submit?",
-		Default: true,
-	}
-	err := survey.AskOne(submit, &confirm)
-	return confirm, err
-}
-
-var editSurvey = func(cf func() (config.Config, error), io *iostreams.IOStreams) func() (string, error) {
-	return func() (string, error) {
-		editorCommand, err := cmdutil.DetermineEditor(cf)
-		if err != nil {
-			return "", err
-		}
-		return surveyext.Edit(editorCommand, "*.md", "", io.In, io.Out, io.ErrOut, nil)
+		return pr, repo, nil
 	}
 }
