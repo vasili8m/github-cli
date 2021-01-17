@@ -105,7 +105,7 @@ func CommentableRun(opts *CommentableOptions) error {
 			return err
 		}
 		if !cont {
-			return fmt.Errorf("Discarding...")
+			return errors.New("Discarding...")
 		}
 	}
 
